@@ -1876,7 +1876,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.10",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -6533,9 +6533,8 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6249a065adc1edbc1704a95436f38dd60476064dbc3b7c47cf279e02d1590eb5"
+version = "1.5.0"
+source = "git+https://github.com/danielpetri1/noq?rev=fb242c4774ac31b00b39e489c1c32a7caa629b15#fb242c4774ac31b00b39e489c1c32a7caa629b15"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -6555,9 +6554,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c01a35be3ed37558c8db69554419f24eff8a63599b54f711bbe3863ec727c47d"
+version = "1.5.0"
+source = "git+https://github.com/danielpetri1/noq?rev=fb242c4774ac31b00b39e489c1c32a7caa629b15#fb242c4774ac31b00b39e489c1c32a7caa629b15"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -6583,9 +6581,8 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d0160422832eea1cc11c34be04ee6d5a046452b0b46cfb14695d55a1f24c954"
+version = "1.5.0"
+source = "git+https://github.com/danielpetri1/noq?rev=fb242c4774ac31b00b39e489c1c32a7caa629b15#fb242c4774ac31b00b39e489c1c32a7caa629b15"
 dependencies = [
  "cfg_aliases",
  "libc",
