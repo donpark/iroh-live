@@ -34,8 +34,8 @@ use iroh_live::{
     EndpointConfig, Node,
     layout::LiveLayout,
     media::{
-        AudioSource, FileEnd, LocalBroadcast, VideoEncoding, VideoRendition, VideoSource, audio,
-        audio_encoding, video,
+        AudioSource, FileEnd, LiveLayoutExt, LocalBroadcast, VideoEncoding, VideoRendition,
+        VideoSource, audio, audio_encoding, video,
     },
 };
 
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let layout = LiveLayout::default();
     let node = Node::new(endpoint.clone(), layout.config());
     let router = node.mount(Router::builder(endpoint)).spawn();
-    let broadcast: LocalBroadcast = layout.publish(&node, "hello")?;
+    let broadcast: LocalBroadcast = layout.publish_media(&node, "hello")?;
 
     let mut capture = video::capture::Config::default();
     if screen {
