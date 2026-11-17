@@ -254,7 +254,7 @@ struct VideoPublish {
 /// A running audio publish.
 #[derive(Debug)]
 struct AudioPublish {
-    rendition: String,
+    renditions: Vec<String>,
     task: AudioTask,
 }
 
@@ -544,7 +544,82 @@ impl AudioPublisher<'_> {
             source,
             options,
         );
-        *self.0.audio.lock().expect("poisoned") = Some(AudioPublish { rendition, task });
+        *self.0.audio.lock().expect("poisoned") = Some(AudioPublish {
+            renditions: vec![rendition],
+            task,
+        });
+    }
+
+    /// Publishes `source` as several audio renditions at once — the same audio in different codecs or
+    /// bitrates — so each subscriber picks the one it can decode and its network affords, and can switch
+    /// between them mid-stream (like a video ladder). Only subscribed tracks cost bandwidth.
+    ///
+    /// The source is opened once and its frames fan out to one encoder per rendition. A rendition whose
+    /// encoder cannot open (or later fails) is dropped with a warning; the others keep publishing.
+    ///
+    /// Replaces whatever was publishing before. A device source publishes only the first rendition.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `renditions` is empty or two resolve to the same track name.
+    pub fn set_renditions(
+        &self,
+        source: impl Into<AudioSource>,
+        renditions: Vec<moq_audio::encode::Options>,
+    ) -> Result<(), PublishError> {
+        if renditions.is_empty() {
+            return Err(n0_error::e!(PublishError::NoRenditions));
+        }
+        let names: Vec<String> = renditions
+            .iter()
+            .map(|options| {
+                options
+                    .track
+                    .clone()
+                    .unwrap_or_else(|| options.settings.codec.to_string())
+            })
+            .collect();
+        check_unique(names.iter().map(String::as_str))?;
+        let source = source.into();
+        let mut renditions = renditions;
+        let (task, names) = match source {
+            AudioSource::Frames { input, frames } => {
+                let broadcast = self.0.broadcast.clone();
+                let catalog = self.0.catalog.lock().expect("poisoned").clone();
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                let token = shutdown.clone();
+                let task = AbortOnDropHandle::new(n0_future::task::spawn(
+                    async move {
+                        if let Err(err) = publish_audio_renditions(
+                            broadcast, catalog, input, frames, renditions, token,
+                        )
+                        .await
+                        {
+                            warn!(error = %err, "audio publish stopped");
+                        }
+                    }
+                    .instrument(error_span!("audio-publish")),
+                ));
+                (AudioTask::Shared { shutdown, task }, names)
+            }
+            #[cfg(feature = "capture")]
+            device @ AudioSource::Device(_) => {
+                let first = renditions.swap_remove(0);
+                let task = spawn_audio(
+                    self.0.broadcast.clone(),
+                    self.0.catalog.lock().expect("poisoned").clone(),
+                    self.0.clock,
+                    device,
+                    first,
+                );
+                (task, names.into_iter().take(1).collect())
+            }
+        };
+        *self.0.audio.lock().expect("poisoned") = Some(AudioPublish {
+            renditions: names,
+            task,
+        });
+        Ok(())
     }
 
     /// Stops publishing audio.
@@ -552,14 +627,25 @@ impl AudioPublisher<'_> {
         self.0.audio.lock().expect("poisoned").take();
     }
 
-    /// Returns the name of the rendition currently publishing.
+    /// Returns the names of the renditions currently publishing, in the order given.
+    pub fn renditions(&self) -> Vec<String> {
+        self.0
+            .audio
+            .lock()
+            .expect("poisoned")
+            .as_ref()
+            .map(|track| track.renditions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the name of the (first) rendition currently publishing.
     pub fn rendition(&self) -> Option<String> {
         self.0
             .audio
             .lock()
             .expect("poisoned")
             .as_ref()
-            .map(|track| track.rendition.clone())
+            .and_then(|track| track.renditions.first().cloned())
     }
 }
 
@@ -683,6 +769,60 @@ async fn publish_audio_frames(
         producer.write(&frame)?;
     }
     producer.finish()
+}
+
+/// Fans one PCM stream out to an encoder per rendition. A rendition that fails is dropped; the rest go on.
+async fn publish_audio_renditions(
+    mut broadcast: moq_net::broadcast::Producer,
+    catalog: CatalogProducer,
+    input: moq_audio::encode::Input,
+    mut frames: BoxStream<moq_audio::Frame>,
+    renditions: Vec<moq_audio::encode::Options>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), moq_audio::Error> {
+    let mut producers = Vec::new();
+    let mut first_err = None;
+    for options in &renditions {
+        match moq_audio::encode::Producer::new(
+            &mut broadcast,
+            catalog.clone(),
+            input.clone(),
+            options,
+        ) {
+            Ok(producer) => producers.push((options.settings.codec, producer)),
+            Err(err) => {
+                warn!(codec = %options.settings.codec, error = %err, "audio rendition not published");
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+    if producers.is_empty() {
+        return Err(first_err
+            .unwrap_or_else(|| moq_audio::Error::Unsupported("no audio renditions".into())));
+    }
+    loop {
+        let frame = tokio::select! {
+            frame = frames.next() => frame,
+            () = shutdown.cancelled() => None,
+        };
+        let Some(frame) = frame else { break };
+        producers.retain_mut(|(codec, producer)| match producer.write(&frame) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(codec = %codec, error = %err, "audio rendition stopped");
+                false
+            }
+        });
+        if producers.is_empty() {
+            break;
+        }
+    }
+    for (codec, mut producer) in producers {
+        if let Err(err) = producer.finish() {
+            warn!(codec = %codec, error = %err, "audio rendition did not finish cleanly");
+        }
+    }
+    Ok(())
 }
 
 /// Rejects a rendition set with a repeated name, which would otherwise collide
