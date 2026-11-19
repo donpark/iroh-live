@@ -51,6 +51,9 @@ pub use moq_ext_json::ValueWriter;
 pub use moq_ext_sources::{Error, SlotState, SourceClosed};
 
 pub use self::{
-    publish::{LocalBroadcast, PublishStatus, RenditionState, VideoEncoding, VideoRendition},
+    publish::{
+        AudioRendition, LocalBroadcast, PublishStatus, RenditionState, VideoEncoding,
+        VideoRendition,
+    },
     stats::{AudioEncodeStats, EncodeStats, PublishStats},
 };

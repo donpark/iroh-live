@@ -250,6 +250,63 @@ pub(crate) fn audio_track_name(config: &moq_audio::encode::Config) -> String {
     config.codec.to_string()
 }
 
+/// One encoding of a broadcast's audio.
+///
+/// A broadcast can publish the same audio in several renditions, such as a
+/// low and a high bitrate, or two codecs. Each rendition is a track of its
+/// own in the catalog, and a subscriber picks the one it can decode and its
+/// link can carry. The encoder settings are moq-audio's own [`Config`].
+///
+/// [`Config`]: moq_audio::encode::Config
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct AudioRendition {
+    /// The track name, which a subscriber picks the rendition by.
+    pub name: String,
+    /// The encoder settings: codec, rate, layout, bitrate, frame duration.
+    pub config: moq_audio::encode::Config,
+}
+
+impl AudioRendition {
+    /// Creates a rendition published as track `name`.
+    #[must_use]
+    pub fn new(name: impl Into<String>, config: moq_audio::encode::Config) -> Self {
+        Self {
+            name: name.into(),
+            config,
+        }
+    }
+
+    /// Creates a rendition named after its codec, as `set_audio` publishes.
+    #[must_use]
+    pub fn from_config(config: moq_audio::encode::Config) -> Self {
+        Self::new(audio_track_name(&config), config)
+    }
+}
+
+/// Checks a set of audio renditions without opening an encoder.
+pub(crate) fn validate_audio_renditions(renditions: &[AudioRendition]) -> Result<(), Error> {
+    if renditions.is_empty() {
+        return Err(Error::invalid(
+            "an audio encoding needs at least one rendition",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for rendition in renditions {
+        if rendition.name.is_empty() {
+            return Err(Error::invalid("a rendition name cannot be empty"));
+        }
+        if !seen.insert(rendition.name.as_str()) {
+            return Err(Error::invalid(format!(
+                "two renditions are named {}",
+                rendition.name
+            )));
+        }
+        validate_audio(&rendition.config)?;
+    }
+    Ok(())
+}
+
 /// Checks everything about an audio encoding that can be checked without opening an encoder.
 pub(crate) fn validate_audio(config: &moq_audio::encode::Config) -> Result<(), Error> {
     if config.codec == moq_audio::encode::Codec::Pcm && config.bitrate.is_some() {
@@ -350,6 +407,17 @@ mod tests {
         assert_eq!(config.layout, moq_audio::Layout::Mono);
         assert_eq!(config.codec, moq_audio::encode::Codec::Opus);
         assert!(validate_audio(&config).is_ok());
+    }
+
+    #[test]
+    fn audio_renditions_need_distinct_names() {
+        let low = AudioRendition::new("low", voice());
+        let high = AudioRendition::new("high", music());
+        assert!(validate_audio_renditions(&[low.clone(), high]).is_ok());
+        assert!(validate_audio_renditions(&[low.clone(), low]).is_err());
+        assert!(validate_audio_renditions(&[]).is_err());
+        assert!(validate_audio_renditions(&[AudioRendition::new("", voice())]).is_err());
+        assert_eq!(AudioRendition::from_config(voice()).name, "opus");
     }
 
     #[test]

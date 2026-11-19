@@ -1,4 +1,7 @@
 //! The audio publish task: a microphone, or PCM from any other source.
+//!
+//! The source is read once and fans out to one encoder per rendition. A
+//! rendition that fails ends on its own, and the others go on.
 
 use moq_ext_sources::{
     AudioFormat, AudioKind, AudioSource, ByPtr, Error, SlotState, stats::SharedCell,
@@ -11,34 +14,43 @@ use tracing::{debug, info, warn};
 
 #[cfg(feature = "capture")]
 use super::status::Reporter;
-use super::{Job, SourceClock, encoding::audio_track_name, status::RenditionState};
+use super::{Job, SourceClock, encoding::AudioRendition, status::RenditionState};
 use crate::stats::AudioEncodeStats;
 
-/// Publishes `source` encoded as `encoding` until it ends or the slot stops.
+/// Publishes `source` encoded as every rendition of `renditions` until it ends or the slot stops.
 pub(super) async fn run(
     mut job: Job,
     source: AudioSource,
-    encoding: moq_audio::encode::Config,
+    renditions: Vec<AudioRendition>,
     stop: CancellationToken,
 ) {
     let Some(_tracks) = job.take_over(&stop).await else {
         return;
     };
     let stats = job.stats.audio();
-    let codec = encoding.codec.to_string();
-    stats.update(|stats| stats.codec = Some(codec.clone()));
+    stats.update(|stats| {
+        stats.codec = renditions
+            .first()
+            .map(|rendition| rendition.config.codec.to_string());
+        stats.renditions = renditions
+            .iter()
+            .map(|rendition| (rendition.name.clone(), rendition.config.codec.to_string()))
+            .collect();
+    });
     let result = match source.kind() {
         #[cfg(feature = "capture")]
         // Opened after `take_over`, because an echo canceller attaches to one
         // microphone at a time, and the publication this one replaces holds
         // it until it stops.
-        AudioKind::Microphone(capture) => microphone(&job, capture.clone(), &encoding, &stop).await,
+        AudioKind::Microphone(capture) => {
+            microphone(&job, &stats, capture.clone(), &renditions, &stop).await
+        }
         AudioKind::Pcm { format, fanout } => match fanout.upgrade() {
             Some(fanout) => {
                 let frames = fanout.subscribe();
                 drop(fanout);
                 let _wanted = source.want();
-                pcm(&job, &stats, *format, frames, &encoding, &stop).await
+                pcm(&job, &stats, *format, frames, &renditions, &stop).await
             }
             // The producer is already gone.
             None => Ok(()),
@@ -69,32 +81,65 @@ pub(super) async fn run(
     }
 }
 
-/// Encodes PCM from a fan-out receiver.
+/// Marks rendition `name` failed with `err`, and drops it from the stats.
+fn fail_rendition(
+    job: &Job,
+    stats: &SharedCell<AudioEncodeStats>,
+    name: &str,
+    err: &Error,
+) -> ByPtr<Error> {
+    warn!(rendition = %name, error = format_args!("{err:#}"), "audio rendition failed");
+    stats.update(|stats| drop(stats.renditions.remove(name)));
+    let shared = ByPtr::new(Error::encoder_msg(format!("{err:#}")));
+    job.reporter
+        .rendition(name, RenditionState::Failed(shared.clone()));
+    shared
+}
+
+/// Encodes PCM from a fan-out receiver into every rendition.
 async fn pcm(
     job: &Job,
     stats: &SharedCell<AudioEncodeStats>,
     format: AudioFormat,
     mut frames: broadcast::Receiver<moq_audio::Frame>,
-    encoding: &moq_audio::encode::Config,
+    renditions: &[AudioRendition],
     stop: &CancellationToken,
 ) -> Result<(), Error> {
-    let track = audio_track_name(encoding);
     let input = moq_audio::encode::Input::new(format.sample_rate, format.layout);
-    let mut options = moq_audio::encode::Options::default();
-    options.track = Some(track.clone());
-    options.config = encoding.clone();
-    let mut broadcast = job.producer.clone();
-    let mut encoder =
-        moq_audio::encode::Producer::new(&mut broadcast, job.catalog.clone(), input, &options)
-            .map_err(Error::encoder)?;
-    info!(track = %track, rate = format.sample_rate, "publishing audio");
+    let mut encoders = Vec::with_capacity(renditions.len());
+    let mut last_err = None;
+    for rendition in renditions {
+        let mut options = moq_audio::encode::Options::default();
+        options.track = Some(rendition.name.clone());
+        options.config = rendition.config.clone();
+        let mut broadcast = job.producer.clone();
+        match moq_audio::encode::Producer::new(
+            &mut broadcast,
+            job.catalog.clone(),
+            input.clone(),
+            &options,
+        ) {
+            Ok(encoder) => {
+                info!(track = %rendition.name, rate = format.sample_rate, "publishing audio");
+                job.reporter.rendition(
+                    &rendition.name,
+                    RenditionState::Encoding {
+                        encoder: rendition.config.codec.to_string(),
+                    },
+                );
+                encoders.push((rendition.name.clone(), encoder));
+            }
+            Err(err) => {
+                let err = Error::encoder(err);
+                fail_rendition(job, stats, &rendition.name, &err);
+                last_err = Some(err);
+            }
+        }
+    }
+    if encoders.is_empty() {
+        return Err(last_err.unwrap_or_else(|| Error::invalid("no audio renditions")));
+    }
     job.reporter.slot(SlotState::Running);
-    job.reporter.rendition(
-        &track,
-        RenditionState::Encoding {
-            encoder: encoding.codec.to_string(),
-        },
-    );
 
     let mut source_clock = SourceClock::new(job.clock.clone());
     loop {
@@ -112,32 +157,52 @@ async fn pcm(
             Err(broadcast::error::RecvError::Closed) => break,
         };
         frame.timestamp = source_clock.map(frame.timestamp, None);
-        encoder.write(&frame).map_err(Error::encoder)?;
+        encoders.retain_mut(|(name, encoder)| match encoder.write(&frame) {
+            Ok(()) => true,
+            Err(err) => {
+                let err = Error::encoder(err);
+                fail_rendition(job, stats, name, &err);
+                last_err = Some(err);
+                false
+            }
+        });
+        if encoders.is_empty() {
+            return Err(last_err.unwrap_or_else(|| Error::invalid("no audio renditions")));
+        }
         stats.update(|stats| stats.frames += 1);
     }
-    // Every packet is out. Dropping the finished track releases it.
-    encoder.finish().map(drop).map_err(Error::encoder)
+    // Every packet is out. Dropping the finished tracks releases them.
+    let mut result = Ok(());
+    for (name, encoder) in encoders {
+        if let Err(err) = encoder.finish() {
+            debug!(rendition = %name, error = %err, "audio rendition did not finish cleanly");
+            result = Err(Error::encoder(err));
+        }
+    }
+    result
 }
 
-/// Captures and encodes a microphone through moq-audio's publication.
+/// A rendition's publication, handed from the capture thread.
+#[cfg(feature = "capture")]
+type Publications = Vec<(AudioRendition, moq_audio::encode::Publication)>;
+
+/// Captures a microphone once and encodes it into every rendition through moq-audio's publications.
 ///
-/// The capture producer owns the device and the publication encodes one of
-/// its consumers. Their futures are not `Send` on macOS, so they run on their
-/// own thread.
+/// The capture producer owns the device, and each publication encodes one of
+/// its consumers while someone reads its track. Their futures are not `Send`
+/// on macOS, so they run on their own thread.
 #[cfg(feature = "capture")]
 async fn microphone(
     job: &Job,
+    stats: &SharedCell<AudioEncodeStats>,
     capture: moq_audio::capture::Config,
-    encoding: &moq_audio::encode::Config,
+    renditions: &[AudioRendition],
     stop: &CancellationToken,
 ) -> Result<(), Error> {
-    let track = audio_track_name(encoding);
-    let encode_track = track.clone();
-    let encode_config = encoding.clone();
-
-    let (handle_tx, handle) = oneshot::channel();
+    let (handle_tx, handle) = oneshot::channel::<Result<(Publications, Vec<Error>), Error>>();
     let broadcast = job.producer.clone();
     let catalog = job.catalog.clone();
+    let wanted = renditions.to_vec();
     let driver_stop = stop.child_token();
     let driver = moq_ext_sources::local_task::spawn(
         "audio-capture",
@@ -150,21 +215,44 @@ async fn microphone(
                     return;
                 }
             };
-            let mut options = moq_audio::encode::Capture::new(capture.consume());
-            options.encode.track = Some(encode_track);
-            options.encode.config = encode_config;
-            let (publication, driver) =
-                match moq_audio::encode::publish_capture(broadcast, catalog, options) {
-                    Ok(created) => created,
-                    Err(err) => {
-                        let _ = handle_tx.send(Err(Error::device(err)));
-                        return;
+            let mut publications = Vec::new();
+            let mut drivers = Vec::new();
+            let mut failed = Vec::new();
+            for rendition in wanted {
+                let mut options = moq_audio::encode::Capture::new(capture.consume());
+                options.encode.track = Some(rendition.name.clone());
+                options.encode.config = rendition.config.clone();
+                match moq_audio::encode::publish_capture(
+                    broadcast.clone(),
+                    catalog.clone(),
+                    options,
+                ) {
+                    Ok((publication, driver)) => {
+                        publications.push((rendition, publication));
+                        drivers.push(driver);
                     }
-                };
-            if handle_tx.send(Ok(publication)).is_err() {
+                    Err(err) => {
+                        warn!(rendition = %rendition.name, error = %err, "audio rendition not published");
+                        failed.push((rendition.name, Error::device(err)));
+                    }
+                }
+            }
+            if publications.is_empty() {
+                let err = failed
+                    .pop()
+                    .map(|(_, err)| err)
+                    .unwrap_or_else(|| Error::invalid("no audio renditions"));
+                let _ = handle_tx.send(Err(err));
                 return;
             }
-            // A capture failure also reaches the publication, which reports it
+            let failed: Vec<Error> = failed
+                .into_iter()
+                .map(|(name, err)| Error::device_msg(format!("rendition {name}: {err:#}")))
+                .collect();
+            if handle_tx.send(Ok((publications, failed))).is_err() {
+                return;
+            }
+            // A capture failure also reaches the publications, which report it
             // as `Status::Failed`, so the capture future only logs it.
             let capture = async move {
                 if let Err(err) = capture.run().await {
@@ -172,19 +260,22 @@ async fn microphone(
                 }
                 std::future::pending::<()>().await;
             };
-            let run = driver.run();
+            // Each driver runs until its publication ends. One that fails ends
+            // alone, and its publication reports why.
+            let run = n0_future::join_all(drivers.into_iter().map(|driver| async move {
+                if let Err(err) = driver.run().await {
+                    warn!(error = %err, "a microphone publication stopped");
+                }
+            }));
             tokio::pin!(capture, run);
-            let result = tokio::select! {
-                result = &mut run => result,
-                () = &mut capture => return,
-                () = stop.cancelled() => return,
-            };
-            if let Err(err) = result {
-                warn!(error = %err, "microphone publication stopped");
+            tokio::select! {
+                _ = &mut run => {}
+                () = &mut capture => {}
+                () = stop.cancelled() => {}
             }
         },
     )?;
-    let result = follow(handle, &job.reporter, &track, encoding, stop).await;
+    let result = follow_all(handle, job, stats, stop).await;
     // The capture thread holds the device and the echo canceller. A
     // publication replacing this one asks for them as soon as this returns,
     // so the thread must let go first.
@@ -193,20 +284,60 @@ async fn microphone(
     result
 }
 
-/// Reports the microphone's state changes until it ends or the slot stops.
+/// Follows every rendition's publication until all have ended or the slot stops.
+///
+/// Fails only when every rendition failed.
 #[cfg(feature = "capture")]
-async fn follow(
-    handle: oneshot::Receiver<Result<moq_audio::encode::Publication, Error>>,
-    reporter: &Reporter,
-    track: &str,
-    encoding: &moq_audio::encode::Config,
+async fn follow_all(
+    handle: oneshot::Receiver<Result<(Publications, Vec<Error>), Error>>,
+    job: &Job,
+    stats: &SharedCell<AudioEncodeStats>,
     stop: &CancellationToken,
 ) -> Result<(), Error> {
-    let mut publication = handle
+    let (publications, failed) = handle
         .await
         .map_err(|_| Error::device_msg("the microphone thread stopped before it started"))??;
-    info!(track = %track, "publishing microphone");
+    for err in &failed {
+        // The rendition name is in the message; the state goes to the slot's log.
+        debug!(error = %err, "audio rendition not published");
+    }
+    let names: Vec<String> = publications
+        .iter()
+        .map(|(rendition, _)| rendition.name.clone())
+        .collect();
+    info!(renditions = ?names, "publishing microphone");
+    let results = n0_future::join_all(
+        publications
+            .into_iter()
+            .map(|(rendition, publication)| follow(publication, &job.reporter, rendition, stop)),
+    )
+    .await;
+    let mut last_err = None;
+    let mut any_ok = false;
+    for (name, result) in names.iter().zip(results) {
+        match result {
+            Ok(()) => any_ok = true,
+            Err(err) => {
+                fail_rendition(job, stats, name, &err);
+                last_err = Some(err);
+            }
+        }
+    }
+    match last_err {
+        Some(err) if !any_ok => Err(err),
+        _ => Ok(()),
+    }
+}
 
+/// Reports one rendition's state changes until it ends or the slot stops.
+#[cfg(feature = "capture")]
+async fn follow(
+    mut publication: moq_audio::encode::Publication,
+    reporter: &Reporter,
+    rendition: AudioRendition,
+    stop: &CancellationToken,
+) -> Result<(), Error> {
+    let track = rendition.name.as_str();
     loop {
         let state = tokio::select! {
             state = publication.changed() => state,
@@ -227,7 +358,7 @@ async fn follow(
                 reporter.rendition(
                     track,
                     RenditionState::Encoding {
-                        encoder: encoding.codec.to_string(),
+                        encoder: rendition.config.codec.to_string(),
                     },
                 );
             }

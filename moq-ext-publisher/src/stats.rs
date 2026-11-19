@@ -115,8 +115,13 @@ impl FrameSizes {
 /// The audio publication.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioEncodeStats {
-    /// The codec, such as `opus`.
+    /// The codec of the first rendition, such as `opus`.
     pub codec: Option<String>,
+    /// The codec of each rendition, by track name.
+    ///
+    /// What each track has sent is in [`PublishStats::sent`] under the same
+    /// name. A rendition that failed is no longer listed.
+    pub renditions: BTreeMap<String, String>,
     /// PCM frames written to the encoder.
     pub frames: u64,
     /// PCM frames lost because the broadcast fell behind its source.

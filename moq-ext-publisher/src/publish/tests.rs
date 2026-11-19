@@ -320,3 +320,106 @@ async fn the_broadcast_hands_back_its_sources() {
         .expect("open");
     assert!(broadcast.video_source().is_none());
 }
+
+/// Returns Opus mono voice at `kbps`.
+fn voice_at(kbps: u64) -> moq_audio::encode::Config {
+    let mut config = audio_encoding::voice();
+    config.bitrate = Some(moq_net::bandwidth::Rate::from_kbps(kbps));
+    config
+}
+
+/// Every audio rendition encodes the one source into a track of its own.
+#[tokio::test]
+async fn audio_renditions_each_get_a_track() {
+    let broadcast = LocalBroadcast::new();
+    broadcast
+        .set_audio_renditions(
+            AudioSource::tone(440.0, moq_audio::Layout::Mono).expect("the tone thread starts"),
+            [
+                AudioRendition::new("low", voice_at(16)),
+                AudioRendition::new("high", voice_at(64)),
+            ],
+        )
+        .expect("valid renditions");
+    audio_becomes(&broadcast, SlotState::Running).await;
+    let status = broadcast.status().borrow().clone();
+    for name in ["low", "high"] {
+        assert!(
+            matches!(status.renditions[name], RenditionState::Encoding { .. }),
+            "{name} is not encoding: {:?}",
+            status.renditions[name]
+        );
+    }
+    let audio = broadcast.stats().audio.expect("audio stats");
+    let listed: Vec<&str> = audio.renditions.keys().map(String::as_str).collect();
+    assert_eq!(listed, ["high", "low"]);
+}
+
+/// A rendition whose encoder cannot open fails alone, and the others go on.
+#[tokio::test]
+async fn a_failed_audio_rendition_leaves_the_others_running() {
+    let broadcast = LocalBroadcast::new();
+    // Opus has no 44.1 kHz mode. Validation passes, and the encoder refuses it.
+    let mut broken = audio_encoding::voice();
+    broken.sample_rate = 44_100;
+    broadcast
+        .set_audio_renditions(
+            AudioSource::tone(440.0, moq_audio::Layout::Mono).expect("the tone thread starts"),
+            [
+                AudioRendition::new("broken", broken),
+                AudioRendition::new("voice", audio_encoding::voice()),
+            ],
+        )
+        .expect("valid renditions");
+    audio_becomes(&broadcast, SlotState::Running).await;
+    let status = broadcast.status().borrow().clone();
+    assert!(
+        matches!(status.renditions["broken"], RenditionState::Failed(_)),
+        "the broken rendition did not fail: {:?}",
+        status.renditions["broken"]
+    );
+    assert!(matches!(
+        status.renditions["voice"],
+        RenditionState::Encoding { .. }
+    ));
+    let frames = |broadcast: &LocalBroadcast| {
+        broadcast
+            .stats()
+            .audio
+            .map(|audio| audio.frames)
+            .unwrap_or_default()
+    };
+    let before = frames(&broadcast);
+    tokio::time::timeout(TIMEOUT, async {
+        while frames(&broadcast) <= before + 5 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the remaining rendition stopped encoding");
+    let audio = broadcast.stats().audio.expect("audio stats");
+    assert!(!audio.renditions.contains_key("broken"));
+    assert!(audio.renditions.contains_key("voice"));
+}
+
+/// Every rendition failing fails the slot.
+#[tokio::test]
+async fn all_audio_renditions_failing_fails_the_slot() {
+    let broadcast = LocalBroadcast::new();
+    let mut broken = audio_encoding::voice();
+    broken.sample_rate = 44_100;
+    broadcast
+        .set_audio_renditions(
+            AudioSource::tone(440.0, moq_audio::Layout::Mono).expect("the tone thread starts"),
+            [AudioRendition::new("broken", broken)],
+        )
+        .expect("valid renditions");
+    let mut status = broadcast.status();
+    tokio::time::timeout(
+        TIMEOUT,
+        status.wait_for(|status| matches!(status.audio, SlotState::Failed(_))),
+    )
+    .await
+    .expect("the slot never failed")
+    .expect("the broadcast is alive");
+}

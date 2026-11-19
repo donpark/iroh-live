@@ -131,8 +131,8 @@ pub mod media {
         VideoPlaybackStats, video_rendition,
     };
     pub use moq_ext_publisher::{
-        AudioEncodeStats, EncodeStats, LocalBroadcast, PublishStats, PublishStatus, RenditionState,
-        VideoEncoding, VideoRendition, audio_encoding,
+        AudioEncodeStats, AudioRendition, EncodeStats, LocalBroadcast, PublishStats, PublishStatus,
+        RenditionState, VideoEncoding, VideoRendition, audio_encoding,
     };
     #[cfg(feature = "capture")]
     pub use moq_ext_sources::screen_source;

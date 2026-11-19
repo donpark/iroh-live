@@ -22,7 +22,7 @@ use tracing::{Instrument, Span, debug, info, info_span};
 
 use self::status::{Medium, StatusCell};
 pub use self::{
-    encoding::{VideoEncoding, VideoRendition, music, pcm, voice},
+    encoding::{AudioRendition, VideoEncoding, VideoRendition, music, pcm, voice},
     status::{PublishStatus, RenditionState},
 };
 use crate::stats::{PublishRecorder, PublishStats};
@@ -610,6 +610,9 @@ impl LocalBroadcast {
 
     /// Encodes `source` as the broadcast's audio, replacing the current audio.
     ///
+    /// The one rendition is named after the codec, such as `opus`.
+    /// [`set_audio_renditions`](Self::set_audio_renditions) publishes several.
+    ///
     /// A microphone opens when the publication starts. If it fails then or
     /// later, the audio slot shows the failure in [`status`](Self::status) and
     /// stays failed until the audio is set again.
@@ -627,13 +630,45 @@ impl LocalBroadcast {
         source: AudioSource,
         encoding: moq_audio::encode::Config,
     ) -> Result<(), Error> {
+        self.set_audio_renditions(source, [AudioRendition::from_config(encoding)])
+    }
+
+    /// Encodes `source` into every rendition of `renditions`, replacing the current audio.
+    ///
+    /// The source is read once, and every rendition encodes the same audio
+    /// into a track of its own: two bitrates, or two codecs for subscribers
+    /// that decode different ones. A subscriber reads only the rendition it
+    /// picks, so the others cost encoding but no bandwidth on its link.
+    ///
+    /// A rendition whose encoder fails to open, or fails later, shows as
+    /// failed in [`status`](Self::status) and ends, while the others go on.
+    /// The slot fails only when every rendition has. A microphone encodes a
+    /// rendition only while someone reads it.
+    ///
+    /// # Errors
+    ///
+    /// Fails for an empty list, two renditions with one name, an invalid
+    /// encoding, or with [`Error::Closed`] after [`close`](Self::close).
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    pub fn set_audio_renditions(
+        &self,
+        source: AudioSource,
+        renditions: impl IntoIterator<Item = AudioRendition>,
+    ) -> Result<(), Error> {
         self.check_open()?;
-        encoding::validate_audio(&encoding)?;
-        let name = encoding::audio_track_name(&encoding);
-        info!(parent: &self.shared.span, source = source.label(), track = %name, "audio set");
+        let renditions: Vec<AudioRendition> = renditions.into_iter().collect();
+        encoding::validate_audio_renditions(&renditions)?;
+        let names: Vec<String> = renditions
+            .iter()
+            .map(|rendition| rendition.name.clone())
+            .collect();
+        info!(parent: &self.shared.span, source = source.label(), renditions = ?names, "audio set");
         let kept = SlotSource::Audio(source.clone());
-        self.replace(Medium::Audio, vec![name], kept, move |job, stop| {
-            audio::run(job, source, encoding, stop)
+        self.replace(Medium::Audio, names, kept, move |job, stop| {
+            audio::run(job, source, renditions, stop)
         });
         Ok(())
     }
