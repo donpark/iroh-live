@@ -487,3 +487,51 @@ async fn changing_the_decoder_backend_rebuilds_it() {
     publisher.shutdown().await;
     subscriber.shutdown().await;
 }
+
+/// A publisher retunes one audio rendition, and the subscriber's catalog shows the new bitrate.
+#[tokio::test]
+async fn an_audio_rendition_retune_reaches_the_catalog() {
+    let publisher = node().await;
+    let _router = serve(&publisher);
+    let broadcast = publish(&publisher, "retuned");
+    let voice = |kbps: u64| {
+        let mut config = audio_encoding::voice();
+        config.bitrate = Some(Rate::from_kbps(kbps));
+        config
+    };
+    broadcast
+        .set_audio_renditions(
+            AudioSource::tone(440.0, audio::Layout::Mono).expect("the tone thread starts"),
+            [
+                AudioRendition::new("low", voice(16)),
+                AudioRendition::new("high", voice(64)),
+            ],
+        )
+        .expect("failed to set audio");
+
+    let subscriber = node().await;
+    let remote = subscribe(&subscriber, &publisher, "retuned").await;
+    let catalog = remote
+        .catalog_within(TIMEOUT)
+        .await
+        .expect("no catalog arrived");
+    assert_eq!(catalog.audio.renditions["high"].bitrate, Some(64_000));
+
+    broadcast
+        .set_audio_bitrate("high", Rate::from_kbps(24))
+        .expect("the rendition takes a bitrate");
+    let mut watch = remote.catalog();
+    tokio::time::timeout(
+        TIMEOUT,
+        watch.wait_for(|catalog| {
+            catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.audio.renditions["high"].bitrate == Some(24_000))
+        }),
+    )
+    .await
+    .expect("the catalog never showed the new bitrate")
+    .expect("the catalog watch is alive");
+    let catalog = watch.borrow().clone().expect("a catalog");
+    assert_eq!(catalog.audio.renditions["low"].bitrate, Some(16_000));
+}

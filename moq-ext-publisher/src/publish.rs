@@ -129,7 +129,13 @@ struct Job {
     reporter: status::Reporter,
     /// The task this one replaces. It stops before the track names are taken.
     predecessor: Option<SlotTask>,
+    /// Bitrates asked for by track name while the task runs, from
+    /// [`LocalBroadcast::set_audio_bitrate`]. Audio only; video ignores it.
+    bitrates: watch::Receiver<Bitrates>,
 }
+
+/// Target bitrates by rendition track name.
+type Bitrates = std::collections::BTreeMap<String, moq_net::bandwidth::Rate>;
 
 impl Job {
     /// Stops the predecessor, then locks the track names.
@@ -384,6 +390,10 @@ struct Slot {
     generation: u64,
     task: SlotTask,
     source: SlotSource,
+    /// The slot's track names.
+    names: Vec<String>,
+    /// Bitrates the running task applies by track name.
+    bitrates: watch::Sender<Bitrates>,
 }
 
 /// What a slot encodes, kept so the broadcast can hand it back.
@@ -673,6 +683,46 @@ impl LocalBroadcast {
         Ok(())
     }
 
+    /// Retunes the encoder of the audio rendition `name` to `bitrate` while it runs.
+    ///
+    /// For rate adaptation: a sender lowers its audio bitrate as its uplink
+    /// estimate falls, and raises it again. The rate holds until the audio is
+    /// set again, which starts every rendition at its configured bitrate.
+    /// The encoder clamps to what its codec accepts and reports a rate it
+    /// refuses in the log; the catalog follows the new rate.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Closed`] after [`close`](Self::close), and with an
+    /// invalid-argument error if no audio is set, `name` is not one of its
+    /// renditions, or the source is a microphone (whose encoders moq-audio
+    /// runs on the capture thread, beyond this control).
+    pub fn set_audio_bitrate(
+        &self,
+        name: &str,
+        bitrate: moq_net::bandwidth::Rate,
+    ) -> Result<(), Error> {
+        self.check_open()?;
+        let slot = self.shared.audio.lock().expect("poisoned");
+        let Some(slot) = slot.as_ref() else {
+            return Err(Error::invalid("no audio is set"));
+        };
+        if !slot.names.iter().any(|known| known == name) {
+            return Err(Error::invalid(format!("no audio rendition named {name:?}")));
+        }
+        if let SlotSource::Audio(source) = &slot.source {
+            if !matches!(source.kind(), moq_ext_sources::AudioKind::Pcm { .. }) {
+                return Err(Error::invalid(
+                    "audio bitrate control needs a pushed PCM source, not a microphone",
+                ));
+            }
+        }
+        slot.bitrates.send_modify(|rates| {
+            rates.insert(name.to_string(), bitrate);
+        });
+        Ok(())
+    }
+
     /// Creates a latest-value JSON track `name` in the broadcast, next to the media.
     ///
     /// For a setting or a status that rides along with the video and audio:
@@ -958,6 +1008,7 @@ impl LocalBroadcast {
         let mut slot = lock.lock().expect("poisoned");
         let generation = shared.generations.fetch_add(1, Ordering::Relaxed) + 1;
         let handing_over = Arc::new(AtomicBool::new(false));
+        let (bitrates, bitrates_rx) = watch::channel(Bitrates::new());
         let job = Job {
             producer: shared.producer.clone(),
             catalog: shared.catalog.lock().expect("poisoned").clone(),
@@ -969,12 +1020,15 @@ impl LocalBroadcast {
             stats: shared.stats.clone(),
             reporter: shared.status.begin(medium, generation, &names),
             predecessor: slot.take().map(|previous| previous.task),
+            bitrates: bitrates_rx,
         };
         let task = SlotTask::spawn(span, &shared.closed, handing_over, |stop| run(job, stop));
         *slot = Some(Slot {
             generation,
             task,
             source,
+            names,
+            bitrates,
         });
     }
 

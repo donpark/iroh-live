@@ -423,3 +423,48 @@ async fn all_audio_renditions_failing_fails_the_slot() {
     .expect("the slot never failed")
     .expect("the broadcast is alive");
 }
+
+/// A running audio rendition takes a new bitrate; unknown names and an empty slot are refused.
+#[tokio::test]
+async fn an_audio_rendition_takes_a_new_bitrate_while_it_runs() {
+    let broadcast = LocalBroadcast::new();
+    let rate = moq_net::bandwidth::Rate::from_kbps(24);
+    assert!(
+        broadcast.set_audio_bitrate("low", rate).is_err(),
+        "no audio is set yet"
+    );
+    broadcast
+        .set_audio_renditions(
+            AudioSource::tone(440.0, moq_audio::Layout::Mono).expect("the tone thread starts"),
+            [
+                AudioRendition::new("low", voice_at(16)),
+                AudioRendition::new("high", voice_at(64)),
+            ],
+        )
+        .expect("valid renditions");
+    audio_becomes(&broadcast, SlotState::Running).await;
+    assert!(broadcast.set_audio_bitrate("missing", rate).is_err());
+    broadcast
+        .set_audio_bitrate("high", rate)
+        .expect("a running rendition takes a bitrate");
+    let frames = |broadcast: &LocalBroadcast| {
+        broadcast
+            .stats()
+            .audio
+            .map(|audio| audio.frames)
+            .unwrap_or_default()
+    };
+    let before = frames(&broadcast);
+    tokio::time::timeout(TIMEOUT, async {
+        while frames(&broadcast) <= before + 10 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("encoding goes on after the retune");
+    let status = broadcast.status().borrow().clone();
+    assert!(matches!(
+        status.renditions["high"],
+        RenditionState::Encoding { .. }
+    ));
+}

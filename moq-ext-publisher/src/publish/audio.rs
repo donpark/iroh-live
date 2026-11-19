@@ -142,9 +142,32 @@ async fn pcm(
     job.reporter.slot(SlotState::Running);
 
     let mut source_clock = SourceClock::new(job.clock.clone());
+    let mut bitrates = job.bitrates.clone();
+    // Rates asked for before the encoders existed apply now.
+    bitrates.mark_changed();
+    // The sender goes with the slot; once it has, nothing more can be asked.
+    let mut bitrates_open = true;
     loop {
         let frame = tokio::select! {
             frame = frames.recv() => frame,
+            changed = bitrates.changed(), if bitrates_open => {
+                if changed.is_err() {
+                    bitrates_open = false;
+                } else {
+                    let rates = bitrates.borrow_and_update().clone();
+                    for (name, encoder) in &mut encoders {
+                        let Some(rate) = rates.get(name) else { continue };
+                        if encoder.bitrate() == *rate {
+                            continue;
+                        }
+                        match encoder.set_bitrate(*rate) {
+                            Ok(()) => debug!(rendition = %name, bps = rate.as_bps(), "audio bitrate retuned"),
+                            Err(err) => warn!(rendition = %name, bps = rate.as_bps(), error = %err, "audio bitrate refused"),
+                        }
+                    }
+                }
+                continue;
+            }
             () = stop.cancelled() => break,
         };
         let mut frame = match frame {
