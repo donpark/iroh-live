@@ -525,6 +525,7 @@ mod tests {
             latency: watch::Sender::new(super::super::DEFAULT_LATENCY),
             decoder: watch::Sender::new(moq_video::decode::Kind::Software),
             volume: watch::Sender::new(1.0),
+            audio_rendition: watch::Sender::new(None),
         });
         let clock = super::super::PlayoutClock::new(Duration::from_millis(100));
         let inputs = Inputs {

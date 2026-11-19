@@ -135,17 +135,21 @@ pub(crate) async fn run(inputs: Inputs) {
     let mut catalog = broadcast.catalog();
     let mut epoch = broadcast.epoch();
     let mut volume = controls.volume.subscribe();
+    let mut wanted = controls.audio_rendition.subscribe();
 
     loop {
-        // What to play: the first audio rendition, over the current route.
+        // What to play: the asked-for rendition if the catalog has it, else
+        // the first, over the current route.
         let opened = {
             let known = catalog.borrow_and_update().clone();
             let consumer = epoch.borrow_and_update().consumer.clone();
+            let asked = wanted.borrow_and_update().clone();
             known.zip(consumer).and_then(|(known, consumer)| {
-                let (name, config) = known.audio.renditions.first_key_value()?;
+                let (name, config) = pick(&known.audio.renditions, asked.as_deref())?;
                 Some((name.clone(), config.clone(), consumer))
             })
         };
+        let playing = opened.as_ref().map(|(name, ..)| name.clone());
         let mut reader = match opened {
             Some((name, config, consumer)) => {
                 send_if_changed(&status, |status| status.audio = SlotState::Starting);
@@ -185,7 +189,10 @@ pub(crate) async fn run(inputs: Inputs) {
                         let control = job.control();
                         set_volume(control.as_ref(), *volume.borrow());
                         info!(rendition = %name, "audio playing");
-                        send_if_changed(&status, |status| status.audio = SlotState::Running);
+                        send_if_changed(&status, |status| {
+                            status.audio = SlotState::Running;
+                            status.audio_rendition = Some(name.clone());
+                        });
                         Some((
                             AbortOnDropHandle::new(spawn(
                                 job.run()
@@ -229,6 +236,7 @@ pub(crate) async fn run(inputs: Inputs) {
                     drop(reader);
                     stats.audio.update(|audio| *audio = None);
                     send_if_changed(&status, |status| {
+                        status.audio_rendition = None;
                         if matches!(status.audio, SlotState::Running | SlotState::Starting) {
                             status.audio = SlotState::Ended;
                         }
@@ -237,6 +245,7 @@ pub(crate) async fn run(inputs: Inputs) {
                 }
                 result = async { (&mut reader.as_mut().expect("guarded").0).await }, if reading => {
                     reader = None;
+                    send_if_changed(&status, |status| status.audio_rendition = None);
                     stats.audio.update(|audio| *audio = None);
                     retry.as_mut().reset(tokio::time::Instant::now() + RETRY_AFTER);
                     match result {
@@ -252,9 +261,10 @@ pub(crate) async fn run(inputs: Inputs) {
                     if changed.is_err() {
                         return;
                     }
-                    // A running track keeps playing across a catalog update.
-                    // Only a track that ended or never opened is tried again.
-                    if !reading {
+                    // A running track keeps playing across a catalog update,
+                    // unless the asked-for rendition just appeared. A track
+                    // that ended or never opened is tried again.
+                    if !reading || better(&catalog, &wanted, playing.as_deref()) {
                         break;
                     }
                 }
@@ -266,6 +276,15 @@ pub(crate) async fn run(inputs: Inputs) {
                     break;
                 }
                 () = &mut retry, if !reading => break,
+                changed = wanted.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if !reading || better(&catalog, &wanted, playing.as_deref()) {
+                        debug!(asked = ?*wanted.borrow(), "switching the audio rendition");
+                        break;
+                    }
+                }
                 changed = volume.changed() => {
                     if changed.is_err() {
                         return;
@@ -277,6 +296,30 @@ pub(crate) async fn run(inputs: Inputs) {
             }
         }
     }
+}
+
+/// Returns the rendition named `asked` if `renditions` has it, else the first.
+fn pick<'a, V>(
+    renditions: &'a std::collections::BTreeMap<String, V>,
+    asked: Option<&str>,
+) -> Option<(&'a String, &'a V)> {
+    asked
+        .and_then(|asked| renditions.get_key_value(asked))
+        .or_else(|| renditions.first_key_value())
+}
+
+/// Reports whether the catalog now offers a better pick than `playing`.
+fn better(
+    catalog: &watch::Receiver<Option<Arc<hang::catalog::Catalog>>>,
+    wanted: &watch::Receiver<Option<String>>,
+    playing: Option<&str>,
+) -> bool {
+    let asked = wanted.borrow().clone();
+    let known = catalog.borrow();
+    let Some(known) = known.as_ref() else {
+        return false;
+    };
+    pick(&known.audio.renditions, asked.as_deref()).map(|(name, _)| name.as_str()) != playing
 }
 
 /// Opens the decoder for one rendition.

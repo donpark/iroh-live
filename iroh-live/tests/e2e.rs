@@ -16,9 +16,9 @@ use iroh_live::{
     calls::{Calls, HangUpReason},
     layout::LiveLayout,
     media::{
-        AudioMode, AudioSource, LocalBroadcast, NetworkSample, Player, PlayerConfig, Rate,
-        RemoteBroadcast, SubscriptionExt, VideoEncoding, VideoRendition, VideoSource, audio,
-        audio_encoding,
+        AudioMode, AudioRendition, AudioSource, LocalBroadcast, NetworkSample, Player,
+        PlayerConfig, Rate, RemoteBroadcast, SubscriptionExt, VideoEncoding, VideoRendition,
+        VideoSource, audio, audio_encoding,
         video::{FrameRate, Size, decode},
     },
 };
@@ -254,6 +254,90 @@ async fn opus_audio_crosses_the_transport_and_decodes() {
     })
     .await
     .expect("timed out waiting for decoded audio");
+
+    publisher.shutdown().await;
+    subscriber.shutdown().await;
+}
+
+/// A subscriber picks one of several audio renditions and switches to another mid-stream.
+///
+/// Plays into a null output, so the test needs no audio device.
+#[tokio::test]
+#[traced_test]
+async fn a_subscriber_picks_and_switches_audio_renditions() {
+    let publisher = node().await;
+    let _router = serve(&publisher);
+    let broadcast = publish(&publisher, "two-voices");
+    let voice = |kbps: u64| {
+        let mut config = audio_encoding::voice();
+        config.bitrate = Some(Rate::from_kbps(kbps));
+        config
+    };
+    broadcast
+        .set_audio_renditions(
+            AudioSource::tone(440.0, audio::Layout::Mono).expect("the tone thread starts"),
+            [
+                AudioRendition::new("low", voice(16)),
+                AudioRendition::new("high", voice(64)),
+            ],
+        )
+        .expect("failed to set audio");
+
+    let subscriber = node().await;
+    let remote = subscribe(&subscriber, &publisher, "two-voices").await;
+    let catalog = remote
+        .catalog_within(TIMEOUT)
+        .await
+        .expect("no catalog arrived");
+    let offered: Vec<&str> = catalog
+        .audio
+        .renditions
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(offered, ["high", "low"]);
+
+    let player = remote
+        .play(
+            PlayerConfig::default()
+                .with_audio(AudioMode::Decode)
+                .with_audio_rendition("low"),
+        )
+        .expect("failed to play");
+    let decoded = |player: &Player| player.stats().audio.map_or(0, |audio| audio.frames);
+    let plays = |player: &Player, name: &'static str| {
+        let mut status = player.status();
+        async move {
+            status
+                .wait_for(|status| status.audio_rendition.as_deref() == Some(name))
+                .await
+                .map(drop)
+                .expect("the player is alive");
+        }
+    };
+    tokio::time::timeout(TIMEOUT, plays(&player, "low"))
+        .await
+        .expect("never played the low rendition");
+    tokio::time::timeout(TIMEOUT, async {
+        while decoded(&player) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no audio decoded from the low rendition");
+
+    player.set_audio_rendition(Some("high".to_string()));
+    tokio::time::timeout(TIMEOUT, plays(&player, "high"))
+        .await
+        .expect("never switched to the high rendition");
+    let at_switch = decoded(&player);
+    tokio::time::timeout(TIMEOUT, async {
+        while decoded(&player) <= at_switch {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no audio decoded after the switch");
 
     publisher.shutdown().await;
     subscriber.shutdown().await;

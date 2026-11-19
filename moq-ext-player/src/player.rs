@@ -140,6 +140,12 @@ pub struct PlayerConfig {
     pub latency: Delay,
     /// What to do with the audio, [`AudioMode::Off`] by default.
     pub audio: AudioMode,
+    /// The audio rendition to play, by track name.
+    ///
+    /// `None`, the default, plays the first rendition in the catalog. A name
+    /// the catalog lacks plays the first one until the name appears.
+    /// [`Player::set_audio_rendition`] changes it while playing.
+    pub audio_rendition: Option<String>,
     /// The decoder backend to open, `Auto` by default.
     pub decoder: moq_video::decode::Kind,
     /// How automatic selection follows the link.
@@ -152,6 +158,7 @@ impl Default for PlayerConfig {
             rendition: RenditionMode::default(),
             latency: DEFAULT_LATENCY,
             audio: AudioMode::Off,
+            audio_rendition: None,
             decoder: moq_video::decode::Kind::default(),
             adaptation: Adaptation::default(),
         }
@@ -180,6 +187,13 @@ impl PlayerConfig {
         self
     }
 
+    /// Returns this config with `name` as the audio rendition to play.
+    #[must_use]
+    pub fn with_audio_rendition(mut self, name: impl Into<String>) -> Self {
+        self.audio_rendition = Some(name.into());
+        self
+    }
+
     /// Returns this config with `decoder` as the decoder backend to open.
     #[must_use]
     pub fn with_decoder(mut self, decoder: moq_video::decode::Kind) -> Self {
@@ -202,6 +216,8 @@ pub struct PlayerStatus {
     pub video: SlotState,
     /// The audio slot.
     pub audio: SlotState,
+    /// The audio rendition playing, by track name.
+    pub audio_rendition: Option<String>,
     /// The rendition mode asked for.
     pub mode: RenditionMode,
     /// The rendition on screen.
@@ -242,6 +258,7 @@ pub(crate) struct Controls {
     pub(crate) latency: watch::Sender<Delay>,
     pub(crate) decoder: watch::Sender<moq_video::decode::Kind>,
     pub(crate) volume: watch::Sender<f32>,
+    pub(crate) audio_rendition: watch::Sender<Option<String>>,
 }
 
 /// One playback: video into [`VideoFrames`], audio into the speaker and [`AudioFrames`].
@@ -291,6 +308,7 @@ impl Player {
             latency: watch::Sender::new(config.latency),
             decoder: watch::Sender::new(config.decoder.clone()),
             volume: watch::Sender::new(1.0),
+            audio_rendition: watch::Sender::new(config.audio_rendition.clone()),
         });
         let (audio_frames, _) = broadcast::channel(audio::AUDIO_FRAMES_BACKLOG);
         let clock = PlayoutClock::new(config.latency.min.unwrap_or_default());
@@ -455,6 +473,22 @@ impl Player {
     /// `set_decoder`.
     pub fn set_decoder(&self, decoder: moq_video::decode::Kind) {
         self.controls.decoder.send_replace(decoder);
+    }
+
+    /// Plays the audio rendition `name`, or the catalog's first with `None`.
+    ///
+    /// The player closes the current rendition and opens the new one, so a
+    /// switch can leave a short gap. A name the catalog lacks plays the first
+    /// rendition until the name appears. [`PlayerStatus::audio_rendition`]
+    /// names the one playing. The broadcast's
+    /// [`catalog`](crate::RemoteBroadcast::catalog) lists the renditions, with
+    /// their codecs and bitrates, in `audio.renditions`.
+    pub fn set_audio_rendition(&self, name: Option<String>) {
+        self.controls.audio_rendition.send_if_modified(|current| {
+            let changed = *current != name;
+            *current = name;
+            changed
+        });
     }
 
     /// Sets the audio volume, where 1.0 is unattenuated.
