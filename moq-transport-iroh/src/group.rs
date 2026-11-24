@@ -78,8 +78,8 @@ pub(crate) fn lock(stream: &SharedStream) -> MutexGuard<'_, endpoint::SendStream
 /// one. A stream joining, leaving or moving reranks its group.
 ///
 /// A new urgency does not reach data the stream already has queued right away.
-/// noq 1.4's `set_priority` only stores the value: a stream with queued data
-/// keeps its place in noq's send queue, at the urgency it was queued with,
+/// noq's `set_priority` (still so in 1.5) only stores the value: a stream with
+/// queued data keeps its place in noq's send queue, at the urgency it was queued with,
 /// until its next turn. So a lowered urgency applies after one more turn at
 /// the old one. A raised one, from
 /// [`set_priority`](poll::SendGroup::set_priority) on the group, from a stream
